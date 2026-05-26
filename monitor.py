@@ -8,9 +8,11 @@ uses.
 """
 
 import hid
+import math
 import struct
 import sys
 import time
+from collections import deque
 
 NINTENDO_VID = 0x057E
 JOYCON_R_PID = 0x2007
@@ -45,9 +47,22 @@ def mcu_crc8(data):
     return crc
 
 
-def find_joycon():
-    for dev in hid.enumerate(NINTENDO_VID, 0):
-        if dev["product_id"] in (JOYCON_R_PID, JOYCON_L_PID):
+def find_joycons():
+    """Every connected Joy-Con (right and/or left)."""
+    return [d for d in hid.enumerate(NINTENDO_VID, 0)
+            if d["product_id"] in (JOYCON_R_PID, JOYCON_L_PID)]
+
+
+def find_joycon(side=None):
+    """First Joy-Con, optionally restricted to a side ('R' or 'L').
+
+    With two Joy-Cons connected (right = Ring-Con, left = leg strap), pass
+    side= to target one deterministically instead of grabbing whichever
+    happens to enumerate first.
+    """
+    want = {"R": JOYCON_R_PID, "L": JOYCON_L_PID}.get(side)
+    for dev in find_joycons():
+        if want is None or dev["product_id"] == want:
             return dev
     return None
 
@@ -241,6 +256,14 @@ class JoyCon:
         self.set_ext_config()
         return True
 
+    def init_imu_only(self):
+        """Lightweight init for a bare Joy-Con (e.g. the leg strap): standard
+        full input report + IMU, no MCU/Ring-Con handshake. The leg detection
+        is pure IMU, so this is all the left pad needs."""
+        self.set_input_mode_standard()
+        self.enable_imu(0x01)
+        return True
+
 
 def parse_report(buf):
     if not buf or buf[0] not in (0x30, 0x31, 0x32):
@@ -255,14 +278,111 @@ def parse_report(buf):
     # for the strain value, so frame 2 (offsets 37..48) is corrupted. Pull
     # accel from frame 1 (offsets 25..30) instead — still recent (~5ms older).
     accel = None
+    gyro = None
     if len(buf) >= 31:
         accel = struct.unpack_from("<hhh", buf, 25)
+    if len(buf) >= 37:
+        # Gyro xyz follows accel within the same IMU frame (offset 31).
+        # Frame 1 is intact on both pads — Ring-Con polling only corrupts
+        # frame 2's byte 40, so the right Joy-Con's frame-1 gyro is fine too.
+        gyro = struct.unpack_from("<hhh", buf, 31)
     return {
         "buttons": (btn_r, btn_share, btn_l),
         "right_stick": (rx, ry),
         "strain": strain,
         "accel": accel,
+        "gyro": gyro,
     }
+
+
+class LegTracker:
+    """Pure leg-motion classifier for a thigh-strapped (bare) Joy-Con.
+
+    Feed raw int16 (accel, gyro) triples to update(); read back .state —
+    'rest' | 'run' | 'sprint' | 'squat' — and .squat_reps. No hardware here,
+    so it's unit-testable against a recorded trace (see test_leg.py).
+
+    Squats are detected by how far the gravity vector has tilted from a
+    calibrated rest pose. That's orientation-agnostic: it works for any strap
+    orientation and either Joy-Con's axis-sign convention, instead of
+    hardcoding an axis the way Ringcon-Driver's `accel.z` band does. Running
+    is a rolling mean of gyro magnitude (an energy gate, per Ringcon-Driver).
+
+    The load-bearing trick: running also tilts the leg, so a squat is only
+    counted when the tilt PERSISTS for SQUAT_MIN_FRAMES — a running stride's
+    tilt is transient and never sustains. Thresholds tuned against a worn
+    ~66Hz capture (rest/run/squat).
+    """
+
+    SQUAT_TILT_ON = 45.0     # deg from rest gravity -> entering a squat
+    SQUAT_TILT_OFF = 20.0    # deg -> upright again (hysteresis to re-arm)
+    SQUAT_MIN_FRAMES = 20    # tilt must hold this long (~0.3s @66Hz): longer
+                             # than any running stride (<=12 frames observed),
+                             # shorter than a squat hold (>=31 frames observed)
+    RUN_WIN = 50             # rolling window for the gyro energy gate
+    RUN_ON = 700             # mean |gyro| (raw) -> running
+    SPRINT_ON = 2200         # mean |gyro| (raw) -> sprinting
+
+    def __init__(self):
+        self.rest_accel = None
+        self._win = deque(maxlen=self.RUN_WIN)
+        self._tilt_frames = 0
+        self._armed = True
+        self.squat_reps = 0
+        self.state = "rest"
+        self.tilt = 0.0
+        self.energy = 0.0
+
+    def calibrate(self, accel):
+        """Set/refine the rest gravity vector from a still, WORN sample.
+        Call repeatedly during a brief hold; it converges via a light EMA."""
+        a = tuple(map(float, accel))
+        if self.rest_accel is None:
+            self.rest_accel = a
+        else:
+            self.rest_accel = tuple(0.8 * r + 0.2 * v for r, v in zip(self.rest_accel, a))
+
+    @staticmethod
+    def _angle(a, b):
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(x * x for x in b))
+        if na == 0 or nb == 0:
+            return 0.0
+        c = max(-1.0, min(1.0, sum(x * y for x, y in zip(a, b)) / (na * nb)))
+        return math.degrees(math.acos(c))
+
+    def update(self, accel, gyro):
+        """Feed one IMU sample; returns the current state string."""
+        self._win.append(math.sqrt(sum(x * x for x in gyro)))
+        self.energy = sum(self._win) / len(self._win)
+        self.tilt = self._angle(accel, self.rest_accel) if self.rest_accel else 0.0
+
+        # Squat rep counting: tilt must SUSTAIN past the threshold (that's what
+        # distinguishes a held squat from a transient running stride). Hysteresis
+        # re-arms only after returning near upright.
+        sustained = False
+        if self.tilt >= self.SQUAT_TILT_ON:
+            self._tilt_frames += 1
+            sustained = self._tilt_frames >= self.SQUAT_MIN_FRAMES
+            if self._armed and sustained:
+                self.squat_reps += 1
+                self._armed = False
+        else:
+            self._tilt_frames = 0
+            if self.tilt <= self.SQUAT_TILT_OFF:
+                self._armed = True
+
+        # State: a sustained lean is a squat (wins over the gyro gate, since
+        # running and squatting use different signals and shouldn't co-fire).
+        if sustained:
+            self.state = "squat"
+        elif self.energy >= self.SPRINT_ON:
+            self.state = "sprint"
+        elif self.energy >= self.RUN_ON:
+            self.state = "run"
+        else:
+            self.state = "rest"
+        return self.state
 
 
 def fmt_buttons(b):
