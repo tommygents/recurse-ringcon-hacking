@@ -328,6 +328,7 @@ class LegTracker:
         self._win = deque(maxlen=self.RUN_WIN)
         self._tilt_frames = 0
         self._armed = True
+        self._squatting = False  # latched "squat session in progress"
         self.squat_reps = 0
         self.state = "rest"
         self.tilt = 0.0
@@ -372,9 +373,23 @@ class LegTracker:
             if self.tilt <= self.SQUAT_TILT_OFF:
                 self._armed = True
 
-        # State: a sustained lean is a squat (wins over the gyro gate, since
-        # running and squatting use different signals and shouldn't co-fire).
+        # Latch a "squat session" so state stays 'squat' across the whole
+        # excursion, not just the instants the lean is sustained. Without this
+        # the leg still swings hard between and within reps, so the gyro energy
+        # gate trips and self.state flickers to run/sprint mid-squat. The latch
+        # engages once a lean has been sustained (same signal rep-counting uses,
+        # so a transient running stride can't engage it) and releases only when
+        # the leg is both upright (tilt <= SQUAT_TILT_OFF) AND quiet
+        # (energy < RUN_ON) — i.e. the user has actually stopped, not just
+        # passed through upright between reps while still moving.
         if sustained:
+            self._squatting = True
+        elif self.tilt <= self.SQUAT_TILT_OFF and self.energy < self.RUN_ON:
+            self._squatting = False
+
+        # State: an active squat session wins over the gyro gate, since running
+        # and squatting use different signals and shouldn't co-fire.
+        if self._squatting:
             self.state = "squat"
         elif self.energy >= self.SPRINT_ON:
             self.state = "sprint"

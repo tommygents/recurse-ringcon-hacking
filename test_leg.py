@@ -77,6 +77,21 @@ class LegTraceTests(unittest.TestCase):
         self.assertGreater(
             frac, 0.5, f"run window should read mostly run/sprint, got {frac:.2f}")
 
+    def test_squat_window_mostly_squat(self):
+        # The squat excursion should read 'squat' throughout, not flicker to
+        # run/sprint as the leg swings between/within reps. 'squat' must be a
+        # clear plurality and run/sprint a small minority over the SQUAT window.
+        states, _ = self.replay()
+        sq = states["SQUAT"]
+        squat_frac = sum(1 for s in sq if s == "squat") / len(sq)
+        runlike_frac = sum(1 for s in sq if s in ("run", "sprint")) / len(sq)
+        self.assertGreater(
+            squat_frac, 0.6,
+            f"squat window should read mostly squat, got {squat_frac:.2f}")
+        self.assertLess(
+            runlike_frac, 0.2,
+            f"squat window should rarely read run/sprint, got {runlike_frac:.2f}")
+
     def test_rest_tail_quiet(self):
         states, _ = self.replay()
         tail = states["REST"][-20:]
