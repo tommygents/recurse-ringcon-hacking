@@ -143,6 +143,12 @@ def make_ring_player_cls(state):
             # screen, which lets KEYDOWN/MOUSEBUTTON events pile up. If we
             # don't drain them, the player respawns and immediately processes
             # 1.5s of buffered input (often firing/cycling unexpectedly).
+            #
+            # Also: new_game() replaces game.raycasting with a fresh instance
+            # whose objects_to_render is empty. The very next game.draw() in
+            # the SAME frame then renders nothing for walls / sprites, leaving
+            # one frame of sky + floor with no geometry. Prime the new
+            # raycasting once so the upcoming draw has something to blit.
             if self.health < 1:
                 self.game.object_renderer.game_over()
                 pg.display.flip()
@@ -150,6 +156,7 @@ def make_ring_player_cls(state):
                 pg.event.clear()
                 state.cycle_pulse = False
                 self.game.new_game()
+                self.game.raycasting.update()
 
         def _axis(self, axis, sign):
             a, r = self.state.accel, self.state.rest_accel
@@ -309,11 +316,10 @@ class RingGame(doom_main.Game):
             self.sound.shotgun.play()
             self.player.shot = True
             self.weapon.reloading = True
-        # Cycle pulse: consume and (for now) just print. Hook in here if you
-        # add multiple weapons.
+        # Cycle pulse: switch active weapon.
         if self.state.cycle_pulse:
             self.state.cycle_pulse = False
-            print("[cycle] (no extra weapons in base game)", flush=True)
+            self.weapon.cycle()
 
     def update(self):
         super().update()
