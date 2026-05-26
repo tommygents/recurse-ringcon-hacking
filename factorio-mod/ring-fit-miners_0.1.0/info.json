@@ -1,0 +1,9 @@
+{
+  "name": "ring-fit-miners",
+  "version": "0.1.0",
+  "title": "Ring Fit Miners",
+  "author": "ring-fit-hacking",
+  "factorio_version": "2.0",
+  "description": "Mining drills only operate while you are running in place on the Ring Fit leg strap. Driven by the ring-fit-hacking Python bridge over RCON.",
+  "dependencies": ["base"]
+}
