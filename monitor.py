@@ -56,7 +56,10 @@ class JoyCon:
     OUTPUT_LEN = 49
 
     def __init__(self, path):
-        self.dev = hid.Device(path=path)
+        # cython-hidapi: construct, then open by the bytes path from
+        # hid.enumerate() (apmorton's hid.Device(path=...) constructor is gone).
+        self.dev = hid.device()
+        self.dev.open_path(path)
         self._count = 0
 
     def close(self):
@@ -68,17 +71,20 @@ class JoyCon:
         return c
 
     def _write(self, buf):
-        self.dev.write(bytes(buf).ljust(self.OUTPUT_LEN, b"\x00"))
+        # cython-hidapi write() takes a list of ints (report id is byte 0).
+        self.dev.write(list(bytes(buf).ljust(self.OUTPUT_LEN, b"\x00")))
 
     def read(self, timeout_ms=200):
-        # macOS hidapi sometimes returns -1 on a transient BT stutter and the
-        # `hid` package surfaces it as `HIDException: Success`. Treat any such
-        # spurious failure as an empty read so callers (init retries, the
-        # streaming loop) just try again on the next tick.
+        # cython-hidapi returns a list of ints (empty list on timeout) and
+        # raises OSError on a transient BT stutter. Convert to bytes so the
+        # parsing layer (struct.unpack_from + byte indexing) is unchanged, and
+        # treat any spurious failure as an empty read so callers (init retries,
+        # the streaming loop) just try again on the next tick.
         try:
-            return self.dev.read(362, timeout=timeout_ms)
-        except hid.HIDException:
+            data = self.dev.read(362, timeout_ms)
+        except OSError:
             return b""
+        return bytes(data) if data else b""
 
     def send_subcommand(self, sub_id, data=b""):
         # Standard output report 0x01: timing + neutral rumble + subcommand.

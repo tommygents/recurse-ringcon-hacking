@@ -1,2 +1,2 @@
-hid==1.0.9
+hidapi==0.15.0  # cython-hidapi: prebuilt wheels bundle the native lib (no compiler/brew/DLL)
 pygame-ce==2.5.7
