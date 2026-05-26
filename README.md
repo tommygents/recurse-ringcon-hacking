@@ -25,15 +25,39 @@ Nintendo's MCU subcommand protocol — a port of
 
 `monitor.py` is both the driver and a standalone CLI that streams strain + IMU.
 
+## The leg strap (running & squats)
+
+Ring Fit also straps a **second, bare Joy-Con** (the left — no Ring-Con) to your
+thigh to track **running in place** and **squats**, both from the IMU alone.
+`LegTracker` (in `monitor.py`) reads them:
+
+- **Squats** — detected from the *tilt of the gravity vector* away from a
+  calibrated standing pose (the thigh rotates from vertical toward horizontal).
+  Because it's measured as an angle from rest, it's orientation-agnostic: it
+  works however you strap the Joy-Con on, and for either pad's axis-sign
+  convention. A rep counts only when the lean *persists* (~0.3s), so a running
+  stride's brief tilt doesn't false-count.
+- **Running / sprinting** — a rolling average of gyro magnitude (an "energy"
+  gate): the faster the thigh whips, the higher it reads.
+
+Calibrate by holding still (strapped on) for a moment, then feed `(accel, gyro)`
+samples to `LegTracker.update()` and read `.state`
+(`rest` / `run` / `sprint` / `squat`) and `.squat_reps`. With both pads
+connected, target them by side: `find_joycon(side="R")` for the Ring-Con,
+`find_joycon(side="L")` for the leg.
+
 ## What's here
 
-- **`monitor.py`** — the Ring-Con HID driver (the core), plus a CLI streamer.
+- **`monitor.py`** — the HID driver (the core): Ring-Con strain, the IMU, and
+  `LegTracker` (leg-strap running/squat detection), plus a CLI streamer.
 - **`flappy.py`** — squeeze the ring to flap. Careful input model: runtime
   rest-calibration, refractory window, peak-relative re-arm. (Space = fallback.)
 - **`ski.py`** — squeeze to speed up / pull to slow down; tilt to steer.
 - **`doom_ring.py`** — Ring-Con mod of the `doom/` submodule: tilt to move/turn,
   squeeze to fire, pull to cycle weapon.
 - **`test_flappy.py`** — unit tests for the flap edge-detector (no hardware).
+- **`test_leg.py`** + `leg_trace.csv` — replay a recorded worn-Joy-Con trace
+  through `LegTracker` and assert squat counts / run detection (no hardware).
 - **`doom/`** — git submodule: [`stanislavPetrovV/DOOM-style-game`](https://github.com/stanislavPetrovV/DOOM-style-game).
 
 ## Getting started
@@ -74,7 +98,7 @@ python monitor.py     # stream raw strain + IMU to the terminal
 python flappy.py      # squeeze-to-flap
 python ski.py         # strain = speed, tilt = steering
 python doom_ring.py   # Ring-Con DOOM (needs the doom/ submodule)
-python -m unittest test_flappy   # input-model tests, no hardware
+python -m unittest test_flappy test_leg   # input-model tests, no hardware
 ```
 
 ## Collaborating
