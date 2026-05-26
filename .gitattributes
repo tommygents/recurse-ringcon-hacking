@@ -1,0 +1,4 @@
+# Normalize line endings: store as LF in the repo, check out native.
+# Prevents CRLF/LF churn when collaborating across Windows and macOS/Linux.
+* text=auto eol=lf
+*.py text eol=lf
