@@ -1,12 +1,16 @@
 """Ring-Con-driven Doom (built on StanislavPetrovV/DOOM-style-Game).
 
-Controls
-  Squeeze (push) inward     → fire shotgun (held = auto-fire as it reloads)
-  Pull (stretch apart) edge → cycle weapon (cosmetic for now — base game has 1)
-  Tilt forward / back       → walk forward / back
-  Tilt left  / right        → turn
+Controls (Ring-Con = right hand; leg strap = left Joy-Con)
+  Squeeze (push) inward     → fire (held = auto-fire as it reloads)
+  Pull (stretch apart) edge → cycle weapon
+  Run in place (leg)        → move; tilt forward/back picks the direction
+  Tilt left  / right        → turn / aim
+  Squat (leg)               → freeze the aim for a stable shot
+
+Difficulty tweaks: monster damage is halved and player weapon damage doubled.
 
 On launch, hold the ring still for ~1.5s while the rest pose is calibrated.
+The leg Joy-Con self-calibrates in parallel — stand still while it does.
 
 The base game uses keyboard (WASD) + mouse (look + fire). We subclass Player
 to override movement/mouse_control with Ring-Con-derived values, and patch the
@@ -49,7 +53,7 @@ from player import Player         # noqa: E402
 from weapon import Weapon         # noqa: E402
 from collections import deque     # noqa: E402
 
-from monitor import JoyCon, find_joycon, parse_report  # noqa: E402
+from monitor import JoyCon, find_joycon, parse_report, LegTracker  # noqa: E402
 
 
 # ----- Ring-Con state + reader thread -----
@@ -103,7 +107,7 @@ class RingReader(threading.Thread):
             self._pull_armed = True
 
     def run(self):
-        info = find_joycon()
+        info = find_joycon(side="R")   # Ring-Con is the RIGHT pad
         if not info:
             self.status = "no Joy-Con found"
             return
@@ -130,13 +134,55 @@ class RingReader(threading.Thread):
             jc.close()
 
 
+# ----- Leg Joy-Con reader: feeds the shared LegTracker -----
+
+class LegReader(threading.Thread):
+    """Left (leg-strap) Joy-Con on its own thread. IMU-only init, calibrate the
+    rest pose for calib_s seconds, then feed samples to the LegTracker. Sets
+    .connected once calibrated so the player can tell whether to gate on leg
+    state (no leg pad -> don't gate, game plays the old way)."""
+
+    def __init__(self, info, tracker, calib_s=3.0):
+        super().__init__(daemon=True)
+        self.info = info
+        self.tk = tracker
+        self.calib_s = calib_s
+        self.connected = False
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        jc = JoyCon(self.info["path"])
+        jc.init_imu_only()
+        t0 = time.time()
+        calibrating = True
+        try:
+            while not self._stop.is_set():
+                buf = jc.read(timeout_ms=50)
+                rep = parse_report(buf) if buf else None
+                if not rep or rep["accel"] is None:
+                    continue
+                if calibrating:
+                    self.tk.calibrate(rep["accel"])
+                    if time.time() - t0 >= self.calib_s:
+                        calibrating = False
+                        self.connected = True
+                elif rep["gyro"] is not None:
+                    self.tk.update(rep["accel"], rep["gyro"])
+        finally:
+            jc.close()
+
+
 # ----- Player subclass that consumes RingState -----
 
-def make_ring_player_cls(state):
+def make_ring_player_cls(state, leg, leg_reader):
     class RingPlayer(Player):
         def __init__(self, game):
             super().__init__(game)
             self.state = state
+            self._aim_frozen = False
 
         def check_game_over(self):
             # Base implementation does pg.time.delay(1500) during the death
@@ -156,6 +202,12 @@ def make_ring_player_cls(state):
                 pg.event.clear()
                 state.cycle_pulse = False
                 self.game.new_game()
+                # The 1.5s delay above would otherwise land in the next
+                # clock.tick(FPS) as a ~1500ms delta_time; our leg-driven
+                # movement multiplies speed by that and rockets the fresh
+                # player through a wall (out of bounds). Absorb the delay now
+                # so the next frame's delta_time is normal.
+                self.game.clock.tick()
                 self.game.raycasting.update()
 
         def _axis(self, axis, sign):
@@ -166,20 +218,47 @@ def make_ring_player_cls(state):
             v = max(-1.0, min(1.0, v))
             return 0.0 if abs(v) < TILT_DEADZONE else v
 
+        def _leg_running(self):
+            # No leg pad connected -> don't gate (game plays the old way).
+            if leg_reader is None or not leg_reader.connected:
+                return True
+            return leg.state in ("run", "sprint")
+
         def movement(self):
-            speed = st.PLAYER_SPEED * self.game.delta_time
+            # Cap delta_time so a frame hitch (the death-screen delay, an
+            # alt-tab, a GC pause) can't turn one step into a wall-clipping leap.
+            dt = min(self.game.delta_time, 50)
+            speed = st.PLAYER_SPEED * dt
             pitch = self._axis(self.state.pitch_axis, self.state.pitch_sign)
-            cos_a, sin_a = math.cos(self.angle), math.sin(self.angle)
-            dx = pitch * speed * cos_a
-            dy = pitch * speed * sin_a
-            self.check_wall_collision(dx, dy)
+            # Forward/back only while running in place; tilt picks direction.
+            if self._leg_running():
+                cos_a, sin_a = math.cos(self.angle), math.sin(self.angle)
+                dx = pitch * speed * cos_a
+                dy = pitch * speed * sin_a
+                self.check_wall_collision(dx, dy)
             self.angle %= math.tau
 
         def mouse_control(self):
+            # Squat freezes the aim for a stable shot. Engage on a real (latched)
+            # squat, but RELEASE the instant you stand — keyed on instantaneous
+            # tilt dropping, not the energy-latched leg.state, which lingers
+            # while the stand-up motion keeps gyro energy high.
+            if leg_reader is not None and leg_reader.connected:
+                if leg.state == "squat":
+                    self._aim_frozen = True
+                elif leg.tilt <= LegTracker.SQUAT_TILT_OFF:
+                    self._aim_frozen = False
+                if self._aim_frozen:
+                    self.rel = 0
+                    return
             roll = self._axis(self.state.roll_axis, self.state.roll_sign)
             # delta_time is ms; convert to seconds for a sensible rad/sec rate.
             self.angle += roll * self.state.turn_rate * (self.game.delta_time / 1000.0)
             self.rel = int(roll * 10)
+
+        def get_damage(self, damage):
+            # Monster damage halved (min 1 so hits still register).
+            super().get_damage(max(1, int(damage // 2)))
 
     return RingPlayer
 
@@ -188,9 +267,10 @@ def make_ring_player_cls(state):
 
 WEAPON_SPECS = [
     # name, damage, animation_time (smaller = faster fire), scale, tint RGBA
-    {"name": "Shotgun", "damage": 50,  "anim": 90,  "scale": 0.40, "tint": None},
-    {"name": "Pistol",  "damage": 18,  "anim": 30,  "scale": 0.30, "tint": (255, 240, 140, 255)},
-    {"name": "BFG",     "damage": 110, "anim": 180, "scale": 0.46, "tint": (140, 255, 180, 255)},
+    # Damage is doubled from the base tuning (player buff).
+    {"name": "Shotgun", "damage": 100, "anim": 90,  "scale": 0.40, "tint": None},
+    {"name": "Pistol",  "damage": 36,  "anim": 30,  "scale": 0.30, "tint": (255, 240, 140, 255)},
+    {"name": "BFG",     "damage": 220, "anim": 180, "scale": 0.46, "tint": (140, 255, 180, 255)},
 ]
 
 
@@ -263,9 +343,10 @@ class WeaponLoadout:
 # ----- Game subclass that wires fire/cycle into the loop -----
 
 class RingGame(doom_main.Game):
-    def __init__(self, state, reader, Player_cls):
+    def __init__(self, state, reader, leg_reader, Player_cls):
         self.state = state
         self.reader = reader
+        self.leg_reader = leg_reader
         # Patch globals new_game() pulls from so subsequent new_game() calls
         # (on respawn) also use our subclasses.
         doom_main.Player = Player_cls
@@ -274,6 +355,18 @@ class RingGame(doom_main.Game):
         # Base Game grabs the mouse and hides the cursor; we don't need that.
         pg.event.set_grab(False)
         pg.mouse.set_visible(True)
+
+    def _shutdown(self):
+        # Stop the reader threads and let them close their native HID handles
+        # BEFORE the interpreter tears down. A daemon thread blocked in
+        # cython-hidapi's read() during shutdown segfaults the process on quit
+        # (exit 139). Mirrors the clean stop the other games already do.
+        for r in (self.reader, self.leg_reader):
+            if r is not None:
+                r.stop()
+        for r in (self.reader, self.leg_reader):
+            if r is not None:
+                r.join(timeout=0.5)
 
     def _handle_config_key(self, event):
         s = self.state
@@ -303,6 +396,7 @@ class RingGame(doom_main.Game):
         self.global_trigger = False
         for event in pg.event.get():
             if event.type == pg.QUIT or (event.type == pg.KEYDOWN and event.key == pg.K_ESCAPE):
+                self._shutdown()
                 pg.quit()
                 sys.exit()
             elif event.type == self.global_event:
@@ -388,10 +482,19 @@ def main():
     state = RingState()
     reader = RingReader(state)
     reader.start()
+
+    # Leg Joy-Con (optional): run-to-move + squat-to-freeze-aim. Starts now so
+    # it self-calibrates during the ring calibration screen below.
+    leg = LegTracker()
+    leg_info = find_joycon(side="L")
+    leg_reader = LegReader(leg_info, leg) if leg_info else None
+    if leg_reader:
+        leg_reader.start()
+
     calibrate(state, reader, screen)
 
-    PlayerCls = make_ring_player_cls(state)
-    game = RingGame(state, reader, PlayerCls)
+    PlayerCls = make_ring_player_cls(state, leg, leg_reader)
+    game = RingGame(state, reader, leg_reader, PlayerCls)
     game.run()
 
 
